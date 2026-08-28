@@ -150,7 +150,13 @@ def generate(args):
         audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
 
         human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
-        human_speech_array_slices = human_speech_array_all[:(len(human_speech_array_all)//(human_speech_array_slice_len))*human_speech_array_slice_len].reshape(-1, human_speech_array_slice_len)
+        # Slice into chunk-sized blocks WITHOUT dropping the tail. The previous
+        # floor-based reshape silently discarded any leftover shorter than one
+        # slice, truncating the output (e.g. 4s audio + fn=65 -> 2.4s video).
+        human_speech_array_slices = [
+            human_speech_array_all[i:i + human_speech_array_slice_len]
+            for i in range(0, len(human_speech_array_all), human_speech_array_slice_len)
+        ]
 
         for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
             torch.cuda.synchronize()

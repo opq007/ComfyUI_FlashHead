@@ -214,7 +214,13 @@ class RunningHub_FlashHead_Sampler:
         audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
 
         human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
-        human_speech_array_slices = human_speech_array_all[:(len(human_speech_array_all)//(human_speech_array_slice_len))*human_speech_array_slice_len].reshape(-1, human_speech_array_slice_len)
+        # Slice into chunk-sized blocks WITHOUT dropping the tail. The previous
+        # floor-based reshape silently discarded any leftover shorter than one
+        # slice, truncating the output (e.g. 4s audio + fn=65 -> 2.4s video).
+        human_speech_array_slices = [
+            human_speech_array_all[i:i + human_speech_array_slice_len]
+            for i in range(0, len(human_speech_array_all), human_speech_array_slice_len)
+        ]
 
         output_path = os.path.join(folder_paths.get_output_directory(), f"flashtalk_video_{uuid.uuid4()}.mp4")
         raw_video_path = os.path.join(folder_paths.get_temp_directory(), f"flashtalk_raw_{uuid.uuid4()}.mp4")
