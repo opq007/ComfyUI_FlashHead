@@ -77,6 +77,8 @@ class RunningHub_FlashHead_Sampler:
             "optional": {
                 "width": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
+                "chunk_frames": (["33", "65", "97", "129", "161"], {"default": "65"}),
+                "fps": (["24", "25", "30"], {"default": "25"}),
                 "use_face_crop": ("BOOLEAN", {"default": False}),
                 "composite_to_full": ("BOOLEAN", {"default": False}),
             },
@@ -153,6 +155,26 @@ class RunningHub_FlashHead_Sampler:
         height = kwargs.get('height', infer_params['height'])
         infer_params['width'] = width
         infer_params['height'] = height
+
+        # Chunk size (frames per generation step) and video fps.
+        # 'chunk_frames' maps to frame_num: larger = fewer chunks (less per-chunk
+        # overhead) but higher peak VRAM. 'fps' drives audio alignment
+        # (seq_len = duration*fps); selectable presets only (24/25/30).
+        chunk_frames = int(kwargs.get('chunk_frames', infer_params['frame_num']))
+        tgt_fps = int(kwargs.get('fps', infer_params['tgt_fps']))
+
+        # Safety clamp: frame_num must stay inside the audio sliding-window
+        # (cached_audio_duration * fps), otherwise audio-aligned generation
+        # would overflow. Leave 20% headroom for the context window.
+        max_frames_by_audio = int(infer_params['cached_audio_duration'] * tgt_fps * 0.8)
+        if chunk_frames > max_frames_by_audio:
+            logger.warning(
+                f"chunk_frames={chunk_frames} exceeds audio window at fps={tgt_fps} "
+                f"(max ~{max_frames_by_audio}); clamping to {max_frames_by_audio}"
+            )
+            chunk_frames = max_frames_by_audio
+        infer_params['frame_num'] = chunk_frames
+        infer_params['tgt_fps'] = tgt_fps
 
         use_face_crop = kwargs.get('use_face_crop', False)
         composite_to_full = kwargs.get('composite_to_full', False)
