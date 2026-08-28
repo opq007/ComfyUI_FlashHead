@@ -4,10 +4,26 @@
 从单张图像中检测人脸，裁剪并调整大小到指定尺寸
 """
 import os
+import json
+import uuid
+import tempfile
 from PIL import Image
 import numpy as np
 
 from .cpu_face_handler import CPUFaceHandler
+
+# Last crop bbox file written by get_scaled_bbox(); consumed by the
+# compositor (compositor.py). Updated per-crop.
+LAST_CROP_BBOX_FILE = None
+
+
+def _default_bbox_dir() -> str:
+    try:
+        import folder_paths
+
+        return folder_paths.get_temp_directory()
+    except Exception:
+        return tempfile.gettempdir()
 
 def get_scaled_bbox(
     bbox, img_w, img_h, ratio: float = 1.0, face_image: Image.Image = None
@@ -25,6 +41,8 @@ def get_scaled_bbox(
     Returns:
         裁剪后的人脸图像
     """
+    global LAST_CROP_BBOX_FILE
+
     x1, y1, x2, y2 = bbox
 
     # Calculate center point
@@ -50,6 +68,17 @@ def get_scaled_bbox(
     new_x2 = int(min(img_w, center_x + dis_x_right))
     new_y2 = int(min(img_h, center_y + dis_y_down))
     scaled_bbox = [new_x1, new_y1, new_x2, new_y2]
+
+    # Persist the exact crop bbox + image dims to a unique temp JSON file
+    # so the compositor knows where to paste the generated clip back.
+    try:
+        bbox_file = os.path.join(_default_bbox_dir(), f"_flashhead_crop_bbox_{uuid.uuid4().hex}.json")
+        with open(bbox_file, "w") as bf:
+            json.dump({"bbox": scaled_bbox, "img_w": img_w, "img_h": img_h}, bf)
+        LAST_CROP_BBOX_FILE = bbox_file
+    except Exception:
+        pass  # non-fatal; compositor will skip if file absent
+
     crop_face = face_image.crop(scaled_bbox)
     return crop_face
 

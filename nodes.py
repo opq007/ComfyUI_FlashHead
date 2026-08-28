@@ -25,10 +25,14 @@ from PIL import Image
 import io
 import av
 import yaml
+import threading
+import queue as _queue
 
 # from .flash_head.inference import get_pipeline, get_base_data, get_infer_params, get_audio_embedding, run_pipeline
 from .flash_head.src.pipeline.flash_head_pipeline import FlashHeadPipeline
 from .flash_head.inference import get_audio_embedding, run_pipeline
+from .flash_head.utils.compositor import composite_to_original
+from .flash_head.utils import facecrop
 
 class RunningHub_FlashHead_Loader:
 
@@ -73,6 +77,8 @@ class RunningHub_FlashHead_Sampler:
             "optional": {
                 "width": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
+                "use_face_crop": ("BOOLEAN", {"default": False}),
+                "composite_to_full": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -148,8 +154,9 @@ class RunningHub_FlashHead_Sampler:
         infer_params['width'] = width
         infer_params['height'] = height
 
-        #kiki
-        use_face_crop = False
+        use_face_crop = kwargs.get('use_face_crop', False)
+        composite_to_full = kwargs.get('composite_to_full', False)
+        # 'width' and 'height' define the generated square clip resolution.
 
         # TODO: move to args
         if pipeline.model_type == "pretrained":
@@ -187,7 +194,35 @@ class RunningHub_FlashHead_Sampler:
         human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
         human_speech_array_slices = human_speech_array_all[:(len(human_speech_array_all)//(human_speech_array_slice_len))*human_speech_array_slice_len].reshape(-1, human_speech_array_slice_len)
 
-        generated_list = []
+        output_path = os.path.join(folder_paths.get_output_directory(), f"flashtalk_video_{uuid.uuid4()}.mp4")
+        raw_video_path = os.path.join(folder_paths.get_temp_directory(), f"flashtalk_raw_{uuid.uuid4()}.mp4")
+
+        # ---- Streaming writer: dump each chunk to disk from a background
+        # thread as it is produced, instead of buffering every frame in
+        # memory. This keeps RAM flat regardless of clip length and lets
+        # CPU encoding overlap with the next chunk's GPU inference.
+        frame_queue = _queue.Queue(maxsize=4)
+        write_done = threading.Event()
+        write_error = []
+
+        def _writer():
+            try:
+                with imageio.get_writer(raw_video_path, format='mp4', mode='I',
+                                        fps=tgt_fps, codec='h264', ffmpeg_params=['-bf', '0']) as writer:
+                    while not (write_done.is_set() and frame_queue.empty()):
+                        try:
+                            frames = frame_queue.get(timeout=0.2)
+                        except _queue.Empty:
+                            continue
+                        frames = frames.numpy().astype(np.uint8)
+                        for i in range(frames.shape[0]):
+                            writer.append_data(frames[i, :, :, :])
+            except Exception as e:
+                write_error.append(e)
+
+        writer_thread = threading.Thread(target=_writer, daemon=True)
+        writer_thread.start()
+
         chunk_num = len(human_speech_array_slices)
         self.pbar = comfy.utils.ProgressBar(chunk_num)
         for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
@@ -206,10 +241,28 @@ class RunningHub_FlashHead_Sampler:
             end_time = time.time()
             logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.3f}s")
 
-            generated_list.append(video.cpu())
+            frame_queue.put(video.cpu())
             self.pbar.update(1)
-        output_path = os.path.join(folder_paths.get_output_directory(), f"flashtalk_video_{uuid.uuid4()}.mp4")
-        self.save_video(generated_list, output_path, tmp_wav_path, fps=tgt_fps)
+
+        write_done.set()
+        writer_thread.join()
+        if write_error:
+            raise RuntimeError(f"Video writer failed: {write_error[0]}")
+
+        # merge video and audio
+        cmd = ['ffmpeg', '-i', raw_video_path, '-i', tmp_wav_path, '-c:v', 'copy', '-c:a', 'aac', '-shortest', output_path, '-y']
+        subprocess.run(cmd)
+        os.remove(raw_video_path)
+
+        # Optional: composite the square clip back onto the full-resolution
+        # original image to honour its native aspect ratio.
+        if composite_to_full and use_face_crop and getattr(facecrop, 'LAST_CROP_BBOX_FILE', None):
+            try:
+                output_path = composite_to_original(output_path, tmp_avatar_image_path, facecrop.LAST_CROP_BBOX_FILE)
+            except Exception as comp_err:
+                import traceback
+                logger.error(f"COMPOSITOR ERROR: {comp_err}\n{traceback.format_exc()}")
+
         return (self.create_video_object(output_path), )
 
     def create_video_object(self, video_path):
