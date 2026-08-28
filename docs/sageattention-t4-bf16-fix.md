@@ -45,6 +45,23 @@ RuntimeError: at::Tensor qk_int8_sv_f16_accum_f32_attn(...) failed to dispatch d
 - **官方 SageAttention-1 分支**（纯 Triton）：官方对 pre-Ampere 的建议，但需要换装包，且魔改 SM75 fork 已能跑。
 - **全局模型 fp16**：把 `param_dtype` 从 bf16 改 fp16。可根治但会损失精度、且需确认 VAE/wav2vec 兼容性——不如仅在 attention 输入处 cast 精准。
 
+## 二次修复：输出 dtype 回归（Half vs BFloat16）
+
+首次修复后出现新错误：
+
+```
+RuntimeError: mat1 and mat2 must have the same dtype, but got Half and BFloat16
+  在 self.o(x)（SelfAttention.forward / CrossAttention.forward）
+```
+
+**根因**：`_run_sageattn` 只把 **输入** cast 成 fp16，kernel 输出仍是 fp16 后直接返回。但下游 `self.o` 等线性层权重是模型 dtype **bf16**（`param_dtype=torch.bfloat16`）→ `F.linear(half_x, bf16_W)` 冲突。
+
+**修复**：`_run_sageattn` 内记住 `orig_dtype = v.dtype`，kernel 输出在 return 前 `if x.dtype != orig_dtype: x = x.to(orig_dtype)`。
+
+- pre-Ampere：输入 fp16 进 kernel（拿加速）→ 输出 cast 回 bf16（匹配模型）✓
+- Ampere+：`orig_dtype=bf16`，输入未 cast，输出本为 bf16，条件不触发零开销 ✓
+- SDPA fallback 分支同样被恢复 dtype 覆盖 ✓
+
 ## 验证
 
 - [x] `py_compile` 通过
@@ -52,3 +69,4 @@ RuntimeError: at::Tensor qk_int8_sv_f16_accum_f32_attn(...) failed to dispatch d
 - [x] 无 `_sageattn_supported` 残留引用（上一版错误开关已移除）
 - [x] SAGE 分支条件 == `SAGE_ATTN_AVAILABLE`（装了就启用，无条件）
 - [x] T4 上魔改 sageattention 正常 dispatch（fp16），加速保留
+- [x] 二次修复：kernel 输出 cast 回原 dtype，规避 `mat1 and mat2 must have the same dtype (Half vs BFloat16)`

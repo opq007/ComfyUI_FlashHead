@@ -58,6 +58,9 @@ def _run_sageattn(q, k, v, num_heads):
     # (T4) only dispatch FP16, so BF16 inputs must be cast to FP16 to keep the
     # SageAttention speedup on pre-Ampere GPUs (exactly what the SM75 forks
     # do). On Ampere+ we keep the input dtype (BF16 is officially supported).
+    # The output is cast back to the input dtype so downstream layers (whose
+    # weights stay in the model dtype) don't hit Half-vs-BFloat16 mismatch.
+    orig_dtype = v.dtype
     q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
     k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
     v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
@@ -68,7 +71,10 @@ def _run_sageattn(q, k, v, num_heads):
     except Exception as e:
         logger.warning(f"SageAttention failed ({e}); falling back to SDPA")
         x = F.scaled_dot_product_attention(q, k, v)
-    return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+    if x.dtype != orig_dtype:
+        x = x.to(orig_dtype)
+    return x
 
 
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
