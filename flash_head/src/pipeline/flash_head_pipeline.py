@@ -10,7 +10,7 @@ from einops import rearrange
 
 from transformers import Wav2Vec2FeatureExtractor
 
-from ..modules.flash_head_model import WanModelAudioProject
+from ..modules.flash_head_model import WanModelAudioProject, _is_pre_ampere
 from ...audio_analysis.wav2vec2 import Wav2Vec2Model
 from ...utils.utils import match_and_blend_colors_torch, resize_and_centercrop
 from ...utils.facecrop import process_image
@@ -81,6 +81,15 @@ class FlashHeadPipeline:
         self.model_type = model_type
         self.use_ltx = model_type == "lite"
 
+        # Turing (sm75, e.g. T4) has NO bfloat16 tensor cores. PyTorch silently
+        # emulates bf16 conv/matmul there via fp32 casts (2-4x+ slower, per
+        # openxla#12429 / invoke-ai#9153), which makes vae.decode() ~30s per
+        # chunk. Wan officially recommends fp16 over bf16 for inference, so on
+        # pre-Ampere GPUs we load the VAE in fp16 (diT/audio stay in param_dtype).
+        # NOTE: do NOT use torch.cuda.is_bf16_supported() here - it returns True
+        # on T4 because emulation counts as "supported".
+        self.vae_dtype = torch.float16 if _is_pre_ampere() else param_dtype
+
         if self.use_ltx:
             model_dir = os.path.join(checkpoint_dir, "Model_Lite")
             vae_dir = os.path.join(checkpoint_dir, "VAE_LTX")
@@ -88,7 +97,7 @@ class FlashHeadPipeline:
             from ...ltx_video.ltx_vae import LtxVAE
             self.vae = LtxVAE(
                 pretrained_model_type_or_path=vae_dir,
-                dtype=self.param_dtype,
+                dtype=self.vae_dtype,
                 device=self.device,
             )
         else:
@@ -97,7 +106,7 @@ class FlashHeadPipeline:
             from ...wan.modules import WanVAE
             self.vae = WanVAE(
                 vae_path=vae_path,
-                dtype=self.param_dtype,
+                dtype=self.vae_dtype,
                 device=self.device,
                 parallel=(USE_PARALLEL_VAE and self.use_usp),
             )
@@ -186,7 +195,8 @@ class FlashHeadPipeline:
             self.cond_image_tensor_dict[person_name] = cond_image_tensor
 
             video_frames = cond_image_tensor.repeat(1, 1, self.frame_num, 1, 1)
-            self.ref_img_latent_dict[person_name] = self.vae.encode(video_frames) # (16, 9, 64, 64) / (128, 5, 16, 16)
+            # VAE may run in fp16 on pre-Ampere GPUs (see vae_dtype) -> cast in/out
+            self.ref_img_latent_dict[person_name] = self.vae.encode(video_frames.to(self.vae_dtype)).to(self.param_dtype) # (16, 9, 64, 64) / (128, 5, 16, 16)
             if i == 0:
                 self.reset_person_name(person_name)
 
@@ -286,7 +296,7 @@ class FlashHeadPipeline:
             torch.cuda.synchronize()
             start_decode_time = time.time()
 
-            videos = self.vae.decode(noise)
+            videos = self.vae.decode(noise.to(self.vae_dtype)).to(self.param_dtype)
 
             torch.cuda.synchronize()
             end_decode_time = time.time()
@@ -306,7 +316,7 @@ class FlashHeadPipeline:
 
         torch.cuda.synchronize()
         start_encode_time = time.time()
-        self.latent_motion_frames = self.vae.encode(cond_frame)
+        self.latent_motion_frames = self.vae.encode(cond_frame.to(self.vae_dtype)).to(self.param_dtype)
         torch.cuda.synchronize()
         end_encode_time = time.time()
         if self.rank == 0:
