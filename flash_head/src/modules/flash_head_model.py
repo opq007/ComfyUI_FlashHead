@@ -8,6 +8,7 @@ from diffusers import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 import torch.cuda.amp as amp
 import torch.distributed as dist
+from loguru import logger
 # kiki
 try:
     from xfuser.core.distributed import (
@@ -36,8 +37,40 @@ try:
     SAGE_ATTN_AVAILABLE = True
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
-    
-    
+
+
+def _is_pre_ampere() -> bool:
+    """True on Turing/Volta (sm75/sm70, e.g. T4 / V100).
+
+    Turing tensor cores have no BF16 MMA, so the community SageAttention
+    SM75 build only dispatches FP16 for its int8 CUDA kernels. Feeding BF16
+    there crashes with
+    `qk_int8_sv_f16_accum_f32_attn failed to dispatch data type BFloat16`.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability()
+    return major < 8
+
+
+def _run_sageattn(q, k, v, num_heads):
+    # SageAttention's int8 CUDA kernels are FP16-based. Community SM75 builds
+    # (T4) only dispatch FP16, so BF16 inputs must be cast to FP16 to keep the
+    # SageAttention speedup on pre-Ampere GPUs (exactly what the SM75 forks
+    # do). On Ampere+ we keep the input dtype (BF16 is officially supported).
+    q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+    k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
+    v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
+    if _is_pre_ampere():
+        q, k, v = q.half(), k.half(), v.half()
+    try:
+        x = sageattn(q, k, v)
+    except Exception as e:
+        logger.warning(f"SageAttention failed ({e}); falling back to SDPA")
+        x = F.scaled_dot_product_attention(q, k, v)
+    return rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+
+
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     if compatibility_mode:
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
@@ -46,11 +79,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         x = F.scaled_dot_product_attention(q, k, v)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
     elif SAGE_ATTN_AVAILABLE:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        x = sageattn(q, k, v)
-        x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
+        return _run_sageattn(q, k, v, num_heads)
     elif FLASH_ATTN_3_AVAILABLE:
         q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
