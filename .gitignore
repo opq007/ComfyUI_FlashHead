@@ -45,3 +45,5 @@ sample_results/
 
 # Logs
 *.log
+.codegraph/
+.omo/
